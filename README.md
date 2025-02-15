@@ -1,1 +1,1 @@
-# anomaly-detection-railways
+# ADRI (Anomaly Detection in Railways Images)
