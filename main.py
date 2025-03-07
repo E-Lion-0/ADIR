@@ -8,6 +8,19 @@ from sklearn.ensemble import IsolationForest
 from torchvision.ops import box_convert
 import os
 from scipy.ndimage import generic_filter
+'''
+1. problema della detection di anomalie nel termico, contesto di uso
+2. come funziona SAM2
+3. esperimenti fatti per riconoscere la presenza delle anomalie ( a volte SAM2 è in grado di beccarli, altre volte 
+    guardando i logits possiamo restituirli)
+4. risultati sul dataset sintetico FOSH
+
+:Rilevazione anomalie:
+    Non Deep: con Otzu o Blob detection (entrambe di OpenCV)
+    Deep: SAM^2
+    
+    
+'''
 import utility
 
 
@@ -173,38 +186,11 @@ class RailAnomalyDetector:
         if ret:
             return masks, scores, logits
 
-    def autodetect_grid(self, image, points, labels, save=False, save_path=None, save_name=None, multimask_output=True):
 
-        ballast_mask, _, ballast_logits = self.generate_mask_from_points(image, points, labels,
-                                                                         multimask_output=multimask_output, show=False,
-                                                                         ret=True)
-        height = int(image.shape[0] * 0.58)
-        half = image[height:, :]
 
-        object_masks = self.generate_masks_automatically(half, show=False, ret=True)
-        plt.imshow(half)
-        plt.axis('off')
-        utility.show_anns(object_masks, False)
-        plt.show()
-
-    def autodetect_box(self, image, box, save=False, save_path=None, save_name=None, multimask_output=True):
-
-        ballast_mask, _, ballast_logits = self.generate_mask_from_boxes(image, box, multimask_output=multimask_output,
-                                                                        show=False, ret=True)
-        height = int(image.shape[0] * 0.58)
-        half = image[height:, :]
-
-        object_masks = self.generate_masks_automatically(half, show=False, ret=True)
-        plt.imshow(half)
-        plt.axis('off')
-        utility.show_anns(object_masks, False)
-        plt.show()
-
-    
 
     def video_analysis(self, video_dir, segmented_video_dir, dino_model):
         try:
-
             #Extract frames
             frame_names = [
                 p for p in os.listdir(video_dir)
@@ -373,351 +359,7 @@ class RailAnomalyDetector:
 
 
 
-    def detect_anomaly_in_image(self, image, mask, scores, logits, save_dir, file_name):
 
-        # segmented_img, _ = draw_mask_2(image, masks)
-        # im = Image.fromarray(segmented_img)
-        # save_path = os.path.join(save_dir, file_name[:-4]+".jpg")
-        # im.save(save_path)
-        # ------------------------------
-        # STEP 2: Estrazione della ROI tramite la maschera
-        # ------------------------------
-        mask = mask.astype(np.uint8)
-        # Applica la maschera per ottenere la ROI: questo isola le regioni dei binari (e la massicciata)
-        roi = cv2.bitwise_and(image, image, mask=mask)
-
-        # Trova il bounding box attorno alla ROI per ridurre la porzione di immagine da analizzare
-        coords = cv2.findNonZero(mask)
-        x, y, w, h = cv2.boundingRect(coords)
-        roi_cropped = roi[y:y + h, x:x + w]
-        logits_cropped = logits[y:y + h, x:x + w]
-
-        # Per DINOv2, convertiamo la ROI in un'immagine a 3 canali
-        roi_cropped_color = cv2.cvtColor(roi_cropped, cv2.COLOR_GRAY2BGR)
-
-        # ------------------------------
-        # STEP 3: Configurazione per l'estrazione delle feature patch-wise con DINOv2
-        # ------------------------------
-
-        # Definisci la trasformazione per preparare le patch per DINOv2
-        transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((224, 224)),  # Dimensione di input richiesta dal modello
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
-
-        # Carica il modello DINOv2
-        from dinov2.models import load_model  # Assicurati di avere la libreria corretta
-        dinov2_model = load_model("dinov2_vitb14")
-        dinov2_model.eval()
-
-        def extract_patch_feature(patch):
-            """
-            Data una patch in formato BGR, restituisce il vettore di feature estratto da DINOv2.
-            """
-            input_tensor = transform(patch).unsqueeze(0)  # forma (1, 3, 224, 224)
-            with torch.no_grad():
-                features = dinov2_model(input_tensor)  # Supponiamo restituisca un tensore (1, D)
-            return features.cpu().numpy().flatten()
-
-        # Funzione per calcolare statistiche sui logits in una patch
-        def extract_logits_stats(logits_patch):
-            """
-            Data una patch della mappa dei logits, restituisce ad esempio la media e la varianza dei logits.
-            Queste statistiche possono essere incluse nel vettore di feature.
-            """
-            mean_logit = np.mean(logits_patch)
-            var_logit = np.var(logits_patch)
-            return np.array([mean_logit, var_logit])
-
-        # ------------------------------
-        # STEP 4: Estrazione patch-wise e costruzione del dataset di feature arricchito
-        # ------------------------------
-
-        # Parametri della finestra mobile
-        patch_size = 64  # Dimensione della patch (64x64 pixel)
-        stride = 32  # Step della finestra mobile
-
-        # Inizializza la mappa delle anomalie (stessa dimensione di roi_cropped_color)
-        anomaly_map = np.zeros(roi_cropped_color.shape[:2], dtype=np.uint8)
-
-        # Liste per raccogliere le feature e le posizioni delle patch
-        patch_features = []
-        patch_positions = []  # Per ricordare l'origine di ogni patch (coordinate)
-
-        height, width, _ = roi_cropped_color.shape
-
-        for i in range(0, height - patch_size + 1, stride):
-            for j in range(0, width - patch_size + 1, stride):
-                # Estrae la patch dell'immagine e quella dei logits
-                patch = roi_cropped_color[i:i + patch_size, j:j + patch_size]
-                logits_patch = logits_cropped[i:i + patch_size, j:j + patch_size]
-
-                # Estrai il vettore di feature dalla patch usando DINOv2
-                feature_vec = extract_patch_feature(patch)
-
-                # Estrai le statistiche dai logits della patch
-                logits_stats = extract_logits_stats(logits_patch)
-
-                # Combina le feature estratte da DINOv2 e le statistiche sui logits
-                # Ad esempio, concatenando i vettori (si assume che entrambe le parti siano normalizzate opportunamente)
-                combined_feature = np.concatenate([feature_vec, logits_stats])
-
-                patch_features.append(combined_feature)
-                patch_positions.append((i, j))
-
-        patch_features = np.array(patch_features)
-        print("Dimensione del dataset di feature patch-wise:", patch_features.shape)
-
-        # ------------------------------
-        # STEP 5: Addestramento/Applicazione di Isolation Forest
-        # ------------------------------
-
-        # In un ambiente reale, il modello IF va addestrato su patch normali.
-        # Qui, per esempio, addestriamo su tutte le patch estratte (presumendo che la maggior parte siano normali)
-        if_model = IsolationForest(contamination=0.05, random_state=42)
-        if_model.fit(patch_features)
-
-        # Valutazione patch-wise e costruzione della mappa delle anomalie
-        for idx, feat in enumerate(patch_features):
-            prediction = if_model.predict(feat.reshape(1, -1))
-            i, j = patch_positions[idx]
-            if prediction[0] == -1:
-                # Se la patch risulta anomala, aggiorniamo la mappa delle anomalie
-                anomaly_map[i:i + patch_size, j:j + patch_size] = 255
-
-        # Pulizia morfologica per eliminare piccoli artefatti (opzionale)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        anomaly_map_clean = cv2.morphologyEx(anomaly_map, cv2.MORPH_OPEN, kernel)
-
-        # ------------------------------
-        # STEP 6: Visualizzazione dei risultati
-        # ------------------------------
-
-        plt.figure(figsize=(15, 5))
-        plt.subplot(1, 3, 1)
-        plt.title("Immagine Termica Originale")
-        plt.imshow(image, cmap='gray')
-
-        plt.subplot(1, 3, 2)
-        plt.title("Maschera SAM (Binari)")
-        plt.imshow(mask, cmap='gray')
-
-        plt.subplot(1, 3, 3)
-        plt.title("Segmentazione Anomalie (Con Logits)")
-        plt.imshow(anomaly_map_clean, cmap='gray')
-        plt.show()
-
-
-def grounding_Dino_analyzer(image, model, caption, device, show=False, BOX_TRESHOLD=0.35, TEXT_TRESHOLD=0.25):
-    print("Analysis with Grounding Dino")
-    image_source, gd_image = load_image(image)
-
-    gd_boxes, logits, phrases = predict(
-        model=model,
-        image=gd_image,
-        caption=caption,
-        box_threshold=BOX_TRESHOLD,
-        text_threshold=TEXT_TRESHOLD,
-        device=device,
-    )
-    annotated_frame = annotate(image_source=image_source, boxes=gd_boxes, logits=logits, phrases=phrases)
-
-    if show:
-        cv2.imshow("Visualizing results", annotated_frame)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-    print(phrases, logits)
-
-    h, w, _ = image_source.shape
-    gd_boxes = gd_boxes * torch.Tensor([w, h, w, h])
-    gd_boxes = box_convert(boxes=gd_boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
-    return gd_boxes , phrases, logits.cpu().numpy()
-
-
-
-
-
-def create_grid(box, points_per_row=None):
-    #proper creation of the inputs if wrong
-
-    if points_per_row is None:
-        points_per_row = [2, 2]
-
-    rows = len(points_per_row)
-
-
-
-
-    step_y = int(((box[3]-box[1]) / rows))
-    points = []
-    for row in range(rows):
-        y = step_y * row + int(step_y / 2 ) + box[1]
-        step_x = int(abs(box[2]-box[0]) /points_per_row[row])
-        for i in range(points_per_row[row]):
-            x = step_x * i + box[0] + int(step_x / 2)
-            points.append([x, y])
-    points = np.array(points)
-
-    return points, np.ones(len(points))
-
-
-
-
-
-
-
-def sigmoid(z):
-    return 1 / (1 + np.exp(-z))
-
-
-def is_mask_in_box(mask, box, margin=10):
-    """
-    Verifica se una maschera binaria è contenuta in un box, considerando un margine di tolleranza.
-
-    Args:
-        mask (np.ndarray): Maschera binaria di forma (1, H, W)
-        box (list/tuple): Coordinate del box in formato [x1, y1, x2, y2]
-        margin (int): Margine di tolleranza in pixel da aggiungere al box (default: 10)
-
-    Returns:
-        bool: True se la maschera è contenuta nel box allargato, False altrimenti
-    """
-    # Verifica input
-    assert mask.shape[0] == 1, "La maschera deve avere shape (1, H, W)"
-    assert len(box) == 4, "Il box deve avere 4 coordinate [x1, y1, x2, y2]"
-
-    # Estrai coordinate del box e applica il margine
-    x1, y1, x2, y2 = map(int, box)
-    x1 = max(0, x1 - margin)  # Assicurati di non andare sotto 0
-    y1 = max(0, y1 - margin)
-    x2 = min(mask.shape[2], x2 + margin)  # Assicurati di non superare i limiti dell'immagine
-    y2 = min(mask.shape[1], y2 + margin)
-
-    # Trova le coordinate dei pixel non-zero nella maschera
-    y_coords, x_coords = np.where(mask[0] > 0)
-
-    if len(x_coords) == 0:  # Se la maschera è vuota
-        return True
-
-    # Verifica se tutti i punti della maschera sono dentro il box allargato
-    mask_in_box = (
-            (x_coords >= x1).all() and
-            (x_coords <= x2).all() and
-            (y_coords >= y1).all() and
-            (y_coords <= y2).all()
-    )
-
-    return mask_in_box
-
-
-
-
-
-
-def is_contained(box: np.ndarray, background_box: np.ndarray, threshold: float = 0.9) -> bool:
-    """
-    Verifica se il box è contenuto per almeno il 90% all'interno del background box.
-
-    Args:
-        box (np.ndarray): Array (x_min, y_min, x_max, y_max) del box da verificare.
-        background_box (np.ndarray): Array (x_min, y_min, x_max, y_max) del box di sfondo.
-        threshold (float): Percentuale minima di contenimento (default 0.9).
-
-    Returns:
-        bool: True se il box è contenuto almeno per il 90%, False altrimenti.
-    """
-    # Coordinate dei due box
-    x_min_b, y_min_b, x_max_b, y_max_b = box
-    x_min_bg, y_min_bg, x_max_bg, y_max_bg = background_box
-
-    # Calcolo dell'intersezione tra i due box
-    x_min_int = max(x_min_b, x_min_bg)
-    y_min_int = max(y_min_b, y_min_bg)
-    x_max_int = min(x_max_b, x_max_bg)
-    y_max_int = min(y_max_b, y_max_bg)
-
-    # Calcolo dell'area del box e dell'intersezione
-    box_area = (x_max_b - x_min_b) * (y_max_b - y_min_b)
-    inter_area = max(0, x_max_int - x_min_int) * max(0, y_max_int - y_min_int)
-    if box_area > 30000:
-        return False
-    # Controllo la percentuale di contenimento
-    return (inter_area / box_area) >= threshold if box_area > 0 else False
-
-
-def segmentation_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray):
-    """
-    Calcola IoU, Dice Coefficient, Precision e Recall tra la maschera predetta e la ground truth.
-
-    Args:
-        pred_mask (np.ndarray): Maschera predetta (binaria: 0 o 1)
-        gt_mask (np.ndarray): Maschera ground truth (binaria: 0 o 1)
-
-    Returns:
-        dict: Dizionario con i valori delle metriche {"IoU": float, "Dice": float, "Precision": float, "Recall": float}
-    """
-    pred_mask = pred_mask.astype(bool)
-    gt_mask = gt_mask.astype(bool)
-
-    intersection = np.logical_and(pred_mask, gt_mask).sum()
-    union = np.logical_or(pred_mask, gt_mask).sum()
-
-    IoU = intersection / union if union > 0 else 0.0
-    Dice = (2 * intersection) / (pred_mask.sum() + gt_mask.sum()) if (pred_mask.sum() + gt_mask.sum()) > 0 else 0.0
-
-    TP = intersection  # Veri positivi
-    FP = np.logical_and(pred_mask, ~gt_mask).sum()  # Falsi positivi
-    FN = np.logical_and(~pred_mask, gt_mask).sum()  # Falsi negativi
-
-    Precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-    Recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-
-    return {"IoU": IoU, "Dice": Dice, "Precision": Precision, "Recall": Recall}
-
-
-def find_holes(mask, min_hole_size=50):
-    """
-    Trova i buchi all'interno di un'area nella maschera binaria e restituisce i centroidi dei buchi abbastanza grandi.
-
-    Args:
-        mask (np.ndarray): Maschera binaria (1, H, W) di tipo uint8 (valori 0 e 1 o 0 e 255).
-        min_hole_size (int): Dimensione minima per considerare un buco valido.
-
-    Returns:
-        List[Tuple[int, int]]: Lista di centroidi dei buchi (x, y).
-    """
-    # Rimuove la prima dimensione se la maschera è (1, H, W) -> diventa (H, W)
-    #mask = mask.squeeze()
-
-    # Trova i contorni degli oggetti principali
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Crea una maschera nera di sfondo per disegnare gli oggetti trovati
-    filled_mask = np.zeros_like(mask)
-
-    # Riempie completamente gli oggetti principali per ottenere solo i buchi
-    cv2.drawContours(filled_mask, contours, -1, 255, thickness=cv2.FILLED)
-
-    # Trova i buchi confrontando la maschera riempita con l'originale
-    holes_mask = np.logical_and(filled_mask > 0, mask == 0).astype(np.uint8) * 255
-
-    # Trova i contorni dei buchi
-    hole_contours, _ = cv2.findContours(holes_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    centroids = []
-    for cnt in hole_contours:
-        area = cv2.contourArea(cnt)
-        if area > min_hole_size:  # Filtra i buchi troppo piccoli
-            M = cv2.moments(cnt)
-            if M["m00"] > 0:  # Evita divisioni per zero
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                centroids.append([cx, cy])
-
-    return np.array(centroids),np.random.choice(np.arange(2, 51), size=len(centroids), replace=False)
 
 
 def get_centers_from_mask(mask, min_area=100):
@@ -764,30 +406,7 @@ def get_centers_from_mask(mask, min_area=100):
     return np.array(centers)
 
 
-def find_corresponding_segmentation(image_path, segmentation_folder):
-    """
-    Trova il file di segmentazione corrispondente a un'immagine di input.
 
-    Args:
-        image_path (str): Percorso del file immagine originale.
-        segmentation_folder (str): Directory contenente le segmentazioni.
-
-    Returns:
-        str | None: Percorso del file di segmentazione corrispondente, se esiste. Altrimenti None.
-    """
-    # Estrai il numero dal nome del file originale
-    filename = os.path.basename(image_path)  # Ottieni solo il nome del file
-    number_part = filename.split('_')[-1].split('.')[0]  # Ottieni la parte numerica
-
-    # Costruisci il nome del file di segmentazione
-    segmentation_filename = f"segmentazione_oggetti_{number_part}.png"
-    segmentation_path = os.path.join(segmentation_folder, segmentation_filename)
-
-    # Controlla se il file di segmentazione esiste
-    if os.path.exists(segmentation_path):
-        return segmentation_path
-    else:
-        return None  # Se il file non esiste
 
 
 

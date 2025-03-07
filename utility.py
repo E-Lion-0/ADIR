@@ -2,6 +2,10 @@ import os
 
 import cv2
 import numpy as np
+import torch
+from torchvision.ops import box_convert
+
+from groundingdino.util.inference import load_image, predict, annotate
 from matplotlib import pyplot as plt
 
 
@@ -96,6 +100,7 @@ def show_masks(imag, masks, scores, point_coords=None, box_coords=None, input_la
             plt.title(f"Score: {score:.3f}", fontsize=14)
         plt.axis('off')
         if savefig and save_path is not None and save_name is not None:
+            os.makedirs(save_path, exist_ok=True)
             plt.savefig(f"./{save_path}/{str(save_name[:-4])}_{i}.png", bbox_inches='tight', pad_inches=0,
                         dpi=plt.gcf().dpi)
         if show:
@@ -104,6 +109,13 @@ def show_masks(imag, masks, scores, point_coords=None, box_coords=None, input_la
 
 
 def produce_video(frame_folder, output_video, fps):
+    '''
+
+    :param frame_folder: the folder with the frames of the video to produce
+    :param output_video: the name of the output video with the extension .mp4
+    :param fps: the integer representing the frames per second
+
+    '''
     # Configura i percorsi
     # frame_folder = "./seg_frames_2"  # Cartella dei frame
     # output_video = "output_video_2.mp4"  # Nome del file video
@@ -408,3 +420,218 @@ def advanced_hole_filling(mask, min_hole_size=50):
             result[labels == label] = 1
 
     return result
+
+
+def find_corresponding_segmentation(image_path, segmentation_folder):
+    """
+    Trova il file di segmentazione corrispondente a un'immagine di input.
+
+    Args:
+        image_path (str): Percorso del file immagine originale.
+        segmentation_folder (str): Directory contenente le segmentazioni.
+
+    Returns:
+        str | None: Percorso del file di segmentazione corrispondente, se esiste. Altrimenti None.
+    """
+    # Estrai il numero dal nome del file originale
+    filename = os.path.basename(image_path)  # Ottieni solo il nome del file
+    number_part = filename.split('_')[-1].split('.')[0]  # Ottieni la parte numerica
+
+    # Costruisci il nome del file di segmentazione
+    segmentation_filename = f"segmentazione_oggetti_{number_part}.png"
+    segmentation_path = os.path.join(segmentation_folder, segmentation_filename)
+
+    # Controlla se il file di segmentazione esiste
+    if os.path.exists(segmentation_path):
+        return segmentation_path
+    else:
+        return None  # Se il file non esiste
+
+def segmentation_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray):
+    """
+    Calcola IoU, Dice Coefficient, Precision e Recall tra la maschera predetta e la ground truth.
+
+    Args:
+        pred_mask (np.ndarray): Maschera predetta (binaria: 0 o 1)
+        gt_mask (np.ndarray): Maschera ground truth (binaria: 0 o 1)
+
+    Returns:
+        dict: Dizionario con i valori delle metriche {"IoU": float, "Dice": float, "Precision": float, "Recall": float}
+    """
+    pred_mask = pred_mask.astype(bool)
+    gt_mask = gt_mask.astype(bool)
+
+    intersection = np.logical_and(pred_mask, gt_mask).sum()
+    union = np.logical_or(pred_mask, gt_mask).sum()
+
+    IoU = intersection / union if union > 0 else 0.0
+    Dice = (2 * intersection) / (pred_mask.sum() + gt_mask.sum()) if (pred_mask.sum() + gt_mask.sum()) > 0 else 0.0
+
+    TP = intersection  # Veri positivi
+    FP = np.logical_and(pred_mask, ~gt_mask).sum()  # Falsi positivi
+    FN = np.logical_and(~pred_mask, gt_mask).sum()  # Falsi negativi
+
+    Precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+    Recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+
+    return {"IoU": IoU, "Dice": Dice, "Precision": Precision, "Recall": Recall}
+
+
+def create_grid(box, points_per_row=None):
+    if points_per_row is None:
+        points_per_row = [2, 2]
+
+    rows = len(points_per_row)
+    step_y = int(((box[3] - box[1]) / rows))
+    points = []
+
+    for row in range(rows):
+        y = step_y * row + int(step_y / 2) + box[1]
+        step_x = int(abs(box[2] - box[0]) / points_per_row[row])
+        for i in range(points_per_row[row]):
+            x = step_x * i + box[0] + int(step_x / 2)
+            points.append([x, y])
+    points = np.array(points)
+
+    return points, np.ones(len(points))  # points, labels
+
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+
+def find_holes(mask, min_hole_size=50):
+    """
+    Trova i buchi all'interno di un'area nella maschera binaria e restituisce i centroidi dei buchi abbastanza grandi.
+
+    Args:
+        mask (np.ndarray): Maschera binaria (1, H, W) di tipo uint8 (valori 0 e 1 o 0 e 255).
+        min_hole_size (int): Dimensione minima per considerare un buco valido.
+
+    Returns:
+        List[Tuple[int, int]]: Lista di centroidi dei buchi (x, y).
+    """
+    # Rimuove la prima dimensione se la maschera è (1, H, W) -> diventa (H, W)
+    #mask = mask.squeeze()
+
+    # Trova i contorni degli oggetti principali
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Crea una maschera nera di sfondo per disegnare gli oggetti trovati
+    filled_mask = np.zeros_like(mask)
+
+    # Riempie completamente gli oggetti principali per ottenere solo i buchi
+    cv2.drawContours(filled_mask, contours, -1, 255, thickness=cv2.FILLED)
+
+    # Trova i buchi confrontando la maschera riempita con l'originale
+    holes_mask = np.logical_and(filled_mask > 0, mask == 0).astype(np.uint8) * 255
+
+    # Trova i contorni dei buchi
+    hole_contours, _ = cv2.findContours(holes_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    centroids = []
+    for cnt in hole_contours:
+        area = cv2.contourArea(cnt)
+        if area > min_hole_size:  # Filtra i buchi troppo piccoli
+            M = cv2.moments(cnt)
+            if M["m00"] > 0:  # Evita divisioni per zero
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                centroids.append([cx, cy])
+
+    return np.array(centroids),np.random.choice(np.arange(2, 51), size=len(centroids), replace=False)
+
+def is_contained(box: np.ndarray, background_box: np.ndarray, threshold: float = 0.9) -> bool:
+    """
+    Verifica se il box è contenuto per almeno il 90% all'interno del background box.
+
+    Args:
+        box (np.ndarray): Array (x_min, y_min, x_max, y_max) del box da verificare.
+        background_box (np.ndarray): Array (x_min, y_min, x_max, y_max) del box di sfondo.
+        threshold (float): Percentuale minima di contenimento (default 0.9).
+
+    Returns:
+        bool: True se il box è contenuto almeno per il 90%, False altrimenti.
+    """
+    # Coordinate dei due box
+    x_min_b, y_min_b, x_max_b, y_max_b = box
+    x_min_bg, y_min_bg, x_max_bg, y_max_bg = background_box
+
+    # Calcolo dell'intersezione tra i due box
+    x_min_int = max(x_min_b, x_min_bg)
+    y_min_int = max(y_min_b, y_min_bg)
+    x_max_int = min(x_max_b, x_max_bg)
+    y_max_int = min(y_max_b, y_max_bg)
+
+    # Calcolo dell'area del box e dell'intersezione
+    box_area = (x_max_b - x_min_b) * (y_max_b - y_min_b)
+    inter_area = max(0, x_max_int - x_min_int) * max(0, y_max_int - y_min_int)
+    if box_area > 30000:
+        return False
+    # Controllo la percentuale di contenimento
+    return (inter_area / box_area) >= threshold if box_area > 0 else False
+
+
+def grounding_Dino_analyzer(image, model, caption, device, show=False, BOX_TRESHOLD=0.35, TEXT_TRESHOLD=0.25):
+    print("Analysis with Grounding Dino")
+    image_source, gd_image = load_image(image)
+
+    gd_boxes, logits, phrases = predict(
+        model=model,
+        image=gd_image,
+        caption=caption,
+        box_threshold=BOX_TRESHOLD,
+        text_threshold=TEXT_TRESHOLD,
+        device=device,
+    )
+    annotated_frame = annotate(image_source=image_source, boxes=gd_boxes, logits=logits, phrases=phrases)
+
+    if show:
+        cv2.imshow("Visualizing results", annotated_frame)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    print(phrases, logits)
+
+    h, w, _ = image_source.shape
+    gd_boxes = gd_boxes * torch.Tensor([w, h, w, h])
+    gd_boxes = box_convert(boxes=gd_boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+    return gd_boxes , phrases, logits.cpu().numpy()
+
+def is_mask_in_box(mask, box, margin=10):
+    """
+    Verifica se una maschera binaria è contenuta in un box, considerando un margine di tolleranza.
+
+    Args:
+        mask (np.ndarray): Maschera binaria di forma (1, H, W)
+        box (list/tuple): Coordinate del box in formato [x1, y1, x2, y2]
+        margin (int): Margine di tolleranza in pixel da aggiungere al box (default: 10)
+
+    Returns:
+        bool: True se la maschera è contenuta nel box allargato, False altrimenti
+    """
+    # Verifica input
+    assert mask.shape[0] == 1, "La maschera deve avere shape (1, H, W)"
+    assert len(box) == 4, "Il box deve avere 4 coordinate [x1, y1, x2, y2]"
+
+    # Estrai coordinate del box e applica il margine
+    x1, y1, x2, y2 = map(int, box)
+    x1 = max(0, x1 - margin)  # Assicurati di non andare sotto 0
+    y1 = max(0, y1 - margin)
+    x2 = min(mask.shape[2], x2 + margin)  # Assicurati di non superare i limiti dell'immagine
+    y2 = min(mask.shape[1], y2 + margin)
+
+    # Trova le coordinate dei pixel non-zero nella maschera
+    y_coords, x_coords = np.where(mask[0] > 0)
+
+    if len(x_coords) == 0:  # Se la maschera è vuota
+        return True
+
+    # Verifica se tutti i punti della maschera sono dentro il box allargato
+    mask_in_box = (
+            (x_coords >= x1).all() and
+            (x_coords <= x2).all() and
+            (y_coords >= y1).all() and
+            (y_coords <= y2).all()
+    )
+
+    return mask_in_box
+
