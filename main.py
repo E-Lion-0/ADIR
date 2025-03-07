@@ -8,19 +8,6 @@ from sklearn.ensemble import IsolationForest
 from torchvision.ops import box_convert
 import os
 from scipy.ndimage import generic_filter
-'''
-1. problema della detection di anomalie nel termico, contesto di uso
-2. come funziona SAM2
-3. esperimenti fatti per riconoscere la presenza delle anomalie ( a volte SAM2 è in grado di beccarli, altre volte 
-    guardando i logits possiamo restituirli)
-4. risultati sul dataset sintetico FOSH
-
-:Rilevazione anomalie:
-    Non Deep: con Otzu o Blob detection (entrambe di OpenCV)
-    Deep: SAM^2
-    
-    
-'''
 import utility
 
 
